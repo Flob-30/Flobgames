@@ -1,0 +1,389 @@
+from pathlib import Path
+
+html = r'''<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Physics Builder 3D</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; overflow:hidden; background:#101827; color:#f8fafc; font:14px system-ui, sans-serif; }
+  canvas { display:block; }
+  #panel {
+    position:fixed; z-index:10; top:14px; left:14px; width:260px;
+    padding:14px; border:1px solid #ffffff22; border-radius:14px;
+    background:#111827eF; box-shadow:0 10px 35px #0005; backdrop-filter:blur(8px);
+  }
+  h1 { font-size:18px; margin:0 0 6px; }
+  .sub { color:#cbd5e1; font-size:12px; line-height:1.45; margin:0 0 12px; }
+  .tools { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
+  button {
+    border:1px solid #ffffff1b; border-radius:8px; padding:9px 8px;
+    color:#e2e8f0; background:#334155; cursor:pointer; font-weight:600;
+  }
+  button:hover { background:#475569; }
+  button.active { background:#0f766e; border-color:#2dd4bf; color:white; }
+  #reset { width:100%; margin-top:8px; background:#7f1d1d; }
+  #status { min-height:34px; color:#a7f3d0; font-size:12px; margin-top:10px; line-height:1.4; }
+  #help { position:fixed; bottom:12px; left:14px; max-width:calc(100vw - 28px); background:#111827d9;
+    padding:9px 12px; border-radius:10px; color:#e2e8f0; font-size:12px; line-height:1.6; }
+  #counter { color:#cbd5e1; font-size:12px; margin-top:8px; }
+  @media(max-width:600px) { #panel { width:225px; top:8px; left:8px; padding:10px; } #help { bottom:8px; left:8px; } }
+</style>
+</head>
+<body>
+<section id="panel">
+  <h1>🧪 Physics Builder</h1>
+  <p class="sub">Baue, ziehe und verbinde Dinge. Die Simulation läuft lokal in deinem Browser.</p>
+  <div class="tools">
+    <button class="tool active" data-tool="cube">🧊 Würfel</button>
+    <button class="tool" data-tool="slime">🟢 Schleim</button>
+    <button class="tool" data-tool="glue">🟠 Kleber</button>
+    <button class="tool" data-tool="grab">✋ Greifen</button>
+  </div>
+  <div id="status">Würfel ausgewählt. Auf den Boden klicken, um zu bauen.</div>
+  <div id="counter">Objekte: 0 · Klebeverbindungen: 0</div>
+  <button id="reset">Alles zurücksetzen</button>
+</section>
+<div id="help">
+  <b>Bauen:</b> Boden anklicken · <b>Greifen:</b> Objekt ziehen (oder Greifen-Werkzeug) ·
+  <b>Kleben:</b> Kleber wählen, zwei Objekte anklicken ·
+  <b>Kamera:</b> rechte Maustaste ziehen · <b>Zoom:</b> Mausrad
+</div>
+<script type="module">
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js';
+import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/controls/OrbitControls.js';
+import RAPIER from 'https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.17.3/+esm';
+
+const statusEl = document.querySelector('#status');
+const counterEl = document.querySelector('#counter');
+const setStatus = (s) => statusEl.textContent = s;
+
+async function main() {
+  await RAPIER.init();
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color('#a9cfe4');
+  scene.fog = new THREE.Fog('#a9cfe4', 35, 90);
+  const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, .1, 180);
+  camera.position.set(10, 9, 13);
+
+  const renderer = new THREE.WebGLRenderer({ antialias:true });
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  document.body.appendChild(renderer.domElement);
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 1, 0);
+  controls.enableDamping = true;
+  controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
+  controls.mouseButtons.MIDDLE = THREE.MOUSE.DOLLY;
+  controls.mouseButtons.RIGHT = THREE.MOUSE.ROTATE;
+  // Left-click on canvas is reserved for building/grabbing; camera rotates with right button.
+  controls.mouseButtons.LEFT = THREE.MOUSE.PAN;
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x536477, 2.0));
+  const sun = new THREE.DirectionalLight(0xffffff, 3.0);
+  sun.position.set(8, 18, 10);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  sun.shadow.camera.left = -25; sun.shadow.camera.right = 25;
+  sun.shadow.camera.top = 25; sun.shadow.camera.bottom = -25;
+  scene.add(sun);
+
+  const world = new RAPIER.World({x:0,y:-9.81,z:0});
+  world.timestep = 1/60;
+  world.integrationParameters.numSolverIterations = 8;
+
+  const ground = new THREE.Mesh(
+    new THREE.BoxGeometry(40, .5, 40),
+    new THREE.MeshStandardMaterial({color:0x718274, roughness:.95})
+  );
+  ground.position.y = -.25;
+  ground.receiveShadow = true;
+  scene.add(ground);
+  const floorBody = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0,-.25,0));
+  world.createCollider(RAPIER.ColliderDesc.cuboid(20,.25,20).setFriction(1.0), floorBody);
+  const grid = new THREE.GridHelper(40,40,0x4a6556,0x9aab9d);
+  grid.position.y = .004;
+  scene.add(grid);
+
+  const mats = {
+    cube: new THREE.MeshStandardMaterial({color:0x3984f5, roughness:.45}),
+    slime: new THREE.MeshPhysicalMaterial({color:0x39e88f, roughness:.2, clearcoat:.9, clearcoatRoughness:.12}),
+    glue: new THREE.MeshPhysicalMaterial({color:0xffa629, roughness:.25, clearcoat:.7})
+  };
+  const objects = [];
+  const bonds = [];
+  let tool = 'cube';
+  let nextId = 1;
+  const raycaster = new THREE.Raycaster();
+  const mouse = new THREE.Vector2();
+  const plane = new THREE.Plane(new THREE.Vector3(0,1,0), 0);
+  const dragPlane = new THREE.Plane();
+  const targetPoint = new THREE.Vector3();
+  const tmp = new THREE.Vector3();
+  let pointerDown = null;
+  let drag = null;
+  let glueFirst = null;
+  const ignoreClickMs = 140;
+
+  function updateCounters() {
+    counterEl.textContent = `Objekte: ${objects.length} · Klebeverbindungen: ${bonds.length}`;
+  }
+
+  function makeBody(x,y,z, shape, size, density, friction, restitution) {
+    const rb = world.createRigidBody(
+      RAPIER.RigidBodyDesc.dynamic().setTranslation(x,y,z).setCanSleep(true).setCcdEnabled(true)
+    );
+    let cd;
+    if (shape === 'box') cd = RAPIER.ColliderDesc.cuboid(size.x,size.y,size.z);
+    else cd = RAPIER.ColliderDesc.ball(size);
+    cd.setDensity(density).setFriction(friction).setRestitution(restitution);
+    world.createCollider(cd,rb);
+    return rb;
+  }
+
+  function addCube(x,z,y=3) {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(1,1,1), mats.cube);
+    mesh.position.set(x,y,z); mesh.castShadow=true; mesh.receiveShadow=true; scene.add(mesh);
+    const body = makeBody(x,y,z,'box',{x:.5,y:.5,z:.5},1.5,.85,.08);
+    const item = {id:nextId++,type:'cube',mesh,bodies:[body],meshes:[mesh],springs:[]};
+    objects.push(item); updateCounters(); return item;
+  }
+
+  // Schleim wird aus kollidierenden Partikeln und elastischen Federn aufgebaut.
+  function addSlime(x,z,y=3) {
+    const item = {id:nextId++,type:'slime',mesh:null,bodies:[],meshes:[],springs:[]};
+    const n=3, spacing=.245, radius=.19;
+    const points=[];
+    for(let ix=0;ix<n;ix++) for(let iy=0;iy<n;iy++) for(let iz=0;iz<n;iz++) {
+      const px=x+(ix-1)*spacing, py=y+(iy-1)*spacing, pz=z+(iz-1)*spacing;
+      const mesh=new THREE.Mesh(new THREE.SphereGeometry(radius,12,10),mats.slime);
+      mesh.position.set(px,py,pz); mesh.castShadow=true; mesh.receiveShadow=true; scene.add(mesh);
+      const body=makeBody(px,py,pz,'ball',radius,0.65,.65,.04);
+      item.bodies.push(body); item.meshes.push(mesh); points.push({ix,iy,iz,body});
+    }
+    // Federn zu direkten Nachbarn plus diagonalen Nachbarn stabilisieren das Volumen.
+    for(let i=0;i<points.length;i++) for(let j=i+1;j<points.length;j++) {
+      const a=points[i], b=points[j];
+      const dx=Math.abs(a.ix-b.ix), dy=Math.abs(a.iy-b.iy), dz=Math.abs(a.iz-b.iz);
+      const steps=dx+dy+dz;
+      if(steps===1 || (dx<=1&&dy<=1&&dz<=1&&steps>1)) {
+        const pa=a.body.translation(), pb=b.body.translation();
+        item.springs.push({a:a.body,b:b.body,rest:Math.hypot(pa.x-pb.x,pa.y-pb.y,pa.z-pb.z),
+          k:steps===1?95:48,damp:5});
+      }
+    }
+    objects.push(item); updateCounters(); return item;
+  }
+
+  function centerOf(item) {
+    const c=new THREE.Vector3();
+    for(const b of item.bodies){const p=b.translation();c.add(new THREE.Vector3(p.x,p.y,p.z));}
+    return c.multiplyScalar(1/item.bodies.length);
+  }
+
+  function addBond(a,b) {
+    if(a===b || bonds.some(x=>(x.a===a&&x.b===b)||(x.a===b&&x.b===a))) {
+      setStatus('Diese Objekte sind bereits verbunden.'); return;
+    }
+    const pa=centerOf(a), pb=centerOf(b);
+    bonds.push({a,b,rest:pa.distanceTo(pb),k:180,damp:12,breakAt:9,overload:0});
+    updateCounters();
+    setStatus('Klebeverbindung erstellt. Sie kann bei starker Belastung reißen.');
+  }
+
+  function removeItem(item) {
+    for(let i=bonds.length-1;i>=0;i--) {
+      if(bonds[i].a===item||bonds[i].b===item) bonds.splice(i,1);
+    }
+    item.meshes.forEach(m=>scene.remove(m));
+    item.bodies.forEach(b=>world.removeRigidBody(b));
+    const i=objects.indexOf(item); if(i>=0) objects.splice(i,1);
+    if(glueFirst===item) glueFirst=null;
+    updateCounters();
+  }
+
+  function getIntersections(event) {
+    const rect=renderer.domElement.getBoundingClientRect();
+    mouse.x=((event.clientX-rect.left)/rect.width)*2-1;
+    mouse.y=-((event.clientY-rect.top)/rect.height)*2+1;
+    raycaster.setFromCamera(mouse,camera);
+    return raycaster.intersectObjects(objects.flatMap(o=>o.meshes).concat(ground),false);
+  }
+  function findItem(mesh) { return objects.find(o=>o.meshes.includes(mesh)); }
+
+  function chooseTool(t) {
+    tool=t; glueFirst=null;
+    document.querySelectorAll('[data-tool]').forEach(b=>b.classList.toggle('active',b.dataset.tool===t));
+    setStatus(({cube:'Würfel ausgewählt: Boden anklicken zum Bauen.',
+      slime:'Schleim ausgewählt: Partikelkörper mit elastischen Federn.',
+      glue:'Kleber ausgewählt: zwei Objekte anklicken, um sie zu verbinden.',
+      grab:'Greifen ausgewählt: Objekt anklicken und mit der Maus ziehen.'})[t]);
+  }
+  document.querySelectorAll('[data-tool]').forEach(b=>b.addEventListener('click',()=>chooseTool(b.dataset.tool)));
+
+  renderer.domElement.addEventListener('contextmenu',e=>e.preventDefault());
+
+  renderer.domElement.addEventListener('pointerdown',e=>{
+    if(e.button!==0) return;
+    const hits=getIntersections(e);
+    if(!hits.length) return;
+    const hit=hits[0], item=findItem(hit.object);
+    pointerDown={x:e.clientX,y:e.clientY,time:performance.now(),item,hit};
+    if(item && (tool==='grab' || tool==='cube' || tool==='slime')) {
+      const c=centerOf(item);
+      drag={item, target:c.clone(), plane:new THREE.Plane(
+        camera.getWorldDirection(new THREE.Vector3()).negate(), c
+      ), lastX:e.clientX,lastY:e.clientY};
+      controls.enabled=false;
+      renderer.domElement.setPointerCapture(e.pointerId);
+    }
+  });
+
+  renderer.domElement.addEventListener('pointermove',e=>{
+    if(!drag) return;
+    const rect=renderer.domElement.getBoundingClientRect();
+    mouse.x=((e.clientX-rect.left)/rect.width)*2-1;
+    mouse.y=-((e.clientY-rect.top)/rect.height)*2+1;
+    raycaster.setFromCamera(mouse,camera);
+    if(raycaster.ray.intersectPlane(drag.plane,targetPoint)) {
+      drag.target.copy(targetPoint);
+    }
+  });
+
+  renderer.domElement.addEventListener('pointerup',e=>{
+    const wasDrag=drag;
+    if(wasDrag) {
+      drag=null; controls.enabled=true;
+      if(pointerDown) pointerDown.time=performance.now();
+      return;
+    }
+    if(!pointerDown) return;
+    const pd=pointerDown; pointerDown=null;
+    if(Math.hypot(e.clientX-pd.x,e.clientY-pd.y)>8) return;
+    if(performance.now()-pd.time>1000) return;
+    const hits=getIntersections(e); if(!hits.length) return;
+    const hit=hits[0], item=findItem(hit.object);
+
+    if(tool==='glue') {
+      if(!item){setStatus('Klicke ein Objekt an, um den ersten Klebepunkt zu wählen.');return;}
+      if(!glueFirst){glueFirst=item;setStatus('Erstes Objekt gewählt. Klicke jetzt das zweite Objekt.');}
+      else {addBond(glueFirst,item);glueFirst=null;}
+      return;
+    }
+    if(item) {
+      if(tool==='grab') setStatus('Objekt ausgewählt. Halte die linke Maustaste zum Ziehen.');
+      return;
+    }
+    if(hit.object===ground) {
+      if(tool==='cube') addCube(hit.point.x,hit.point.z,Math.max(1,hit.point.y+1.5));
+      else if(tool==='slime') addSlime(hit.point.x,hit.point.z,Math.max(1.5,hit.point.y+1.5));
+      else if(tool==='grab') setStatus('Wähle ein Objekt zum Greifen.');
+    }
+  });
+
+  // Für das Ziehen werden Kräfte auf alle Teilchen des Schleims verteilt.
+  function applyDrag(dt) {
+    if(!drag) return;
+    const c=centerOf(drag.item);
+    const error=drag.target.clone().sub(c);
+    for(const b of drag.item.bodies) {
+      const p=b.translation(), v=b.linvel();
+      const target=b===drag.item.bodies[0]
+        ? new THREE.Vector3(p.x,p.y,p.z).add(error)
+        : new THREE.Vector3(p.x,p.y,p.z).add(error);
+      const force=target.sub(new THREE.Vector3(p.x,p.y,p.z)).multiplyScalar(85)
+        .sub(new THREE.Vector3(v.x,v.y,v.z).multiplyScalar(12));
+      b.addForce({x:force.x,y:force.y,z:force.z},true);
+    }
+  }
+
+  function applySprings(item) {
+    for(const s of item.springs) {
+      const pa=s.a.translation(), pb=s.b.translation();
+      const va=s.a.linvel(), vb=s.b.linvel();
+      let dx=pb.x-pa.x, dy=pb.y-pa.y, dz=pb.z-pa.z;
+      const dist=Math.hypot(dx,dy,dz)||0.0001;
+      const rel=((vb.x-va.x)*dx+(vb.y-va.y)*dy+(vb.z-va.z)*dz)/dist;
+      const force=s.k*(dist-s.rest)+s.damp*rel;
+      const fx=force*dx/dist, fy=force*dy/dist, fz=force*dz/dist;
+      s.a.addForce({x:fx,y:fy,z:fz},true);
+      s.b.addForce({x:-fx,y:-fy,z:-fz},true);
+    }
+  }
+
+  function applyBonds(dt) {
+    for(let i=bonds.length-1;i>=0;i--) {
+      const s=bonds[i], a=centerOf(s.a), b=centerOf(s.b);
+      const delta=b.clone().sub(a), dist=delta.length()||0.0001;
+      const va=s.a.bodies[0].linvel(), vb=s.b.bodies[0].linvel();
+      const rel=((vb.x-va.x)*delta.x+(vb.y-va.y)*delta.y+(vb.z-va.z)*delta.z)/dist;
+      const magnitude=s.k*(dist-s.rest)+s.damp*rel;
+      if(Math.abs(magnitude)>s.breakAt) s.overload+=dt; else s.overload=0;
+      if(s.overload>.12 || dist> s.rest+1.8) {
+        bonds.splice(i,1); updateCounters();
+        setStatus('Eine Klebeverbindung ist gerissen!');
+        continue;
+      }
+      const f=delta.multiplyScalar(magnitude/dist);
+      for(const body of s.a.bodies) body.addForce({x:f.x/s.a.bodies.length,y:f.y/s.a.bodies.length,z:f.z/s.a.bodies.length},true);
+      for(const body of s.b.bodies) body.addForce({x:-f.x/s.b.bodies.length,y:-f.y/s.b.bodies.length,z:-f.z/s.b.bodies.length},true);
+    }
+  }
+
+  document.querySelector('#reset').addEventListener('click',()=>{
+    for(const o of [...objects]) removeItem(o);
+    drag=null; glueFirst=null;
+    setStatus('Alles zurückgesetzt. Baue etwas Neues!');
+  });
+
+  let last=performance.now(), accumulator=0;
+  const step=1/60;
+  function animate(now) {
+    requestAnimationFrame(animate);
+    accumulator+=Math.min((now-last)/1000,.05); last=now;
+    while(accumulator>=step) {
+      for(const o of objects) if(o.type==='slime') applySprings(o);
+      applyBonds(step);
+      applyDrag(step);
+      world.step();
+      accumulator-=step;
+    }
+    for(const o of objects) {
+      o.bodies.forEach((b,i)=>{
+        const p=b.translation(), r=b.rotation();
+        o.meshes[i].position.set(p.x,p.y,p.z);
+        o.meshes[i].quaternion.set(r.x,r.y,r.z,r.w);
+      });
+    }
+    controls.update();
+    renderer.render(scene,camera);
+  }
+  requestAnimationFrame(animate);
+
+  addEventListener('resize',()=>{
+    camera.aspect=innerWidth/innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth,innerHeight);
+  });
+}
+main().catch(err=>{
+  console.error(err);
+  setStatus('Fehler beim Laden der Physik. Bitte Internetverbindung prüfen und Seite neu laden.');
+});
+</script>
+</body>
+</html>
+'''
+
+path = Path("/mnt/data/physics_builder_3d.html")
+path.write_text(html, encoding="utf-8")
+print(f"Erstellt: {path} ({len(html):,} Zeichen)")
